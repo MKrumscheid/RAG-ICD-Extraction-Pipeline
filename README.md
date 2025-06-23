@@ -75,9 +75,9 @@ login(token="YOUR_HF_TOKEN")
 Given a clinical sentence or doctors note:
 text = "The patient shows no signs of myocardial infarction."
 
-# 1. Embed and search
-# 2. Retrieve closest ICD codes
-# 3. Apply RAG with Mistral to generate a reasoning-backed code suggestion
+ 1. Embed and search
+ 2. Retrieve closest ICD codes
+ 3. Apply RAG with Mistral to generate a reasoning-backed code suggestion
 
 ## Status
 
