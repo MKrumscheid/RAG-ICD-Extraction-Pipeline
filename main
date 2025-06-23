@@ -1,0 +1,524 @@
+import xml.etree.ElementTree as ET
+import multiprocessing as mp
+import numpy as np
+import faiss
+import torch
+import os
+import re
+from vllm.sampling_params import SamplingParams
+from vllm import LLM
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    pipeline,
+    BertTokenizerFast,
+    BertForTokenClassification
+)
+import json
+from rapidfuzz import process, fuzz
+from sentence_transformers import SentenceTransformer
+import spacy
+from spacy.tokens import Doc, Span
+from spacy import displacy
+from negspacy.negation import Negex
+from medical_abbreviations import medical_abbreviations
+import glob
+from huggingface_hub import login as hf_login
+
+hf_login(token = "TOKEN")
+
+torch.multiprocessing.set_start_method('spawn')
+
+device = 0 if torch.cuda.is_available() else -1
+print(f"Using device: {'GPU' if device == 0 else 'CPU'}")
+
+embedding_model_name = "nuvocare/WikiMedical_sent_biobert_multi"
+embedding_model = SentenceTransformer(embedding_model_name, device="cuda" if torch.cuda.is_available() else "cpu")
+
+try:
+    model_name = "mistralai/Mistral-Small-24B-Instruct-2501"
+    sampling_params = SamplingParams(max_tokens=4096, temperature=0.0)
+    llm = LLM(
+        model=model_name,
+        tokenizer_mode="mistral",
+        config_format="mistral",
+        load_format="mistral",
+        #max_model_len=64000,
+        max_model_len=16000  ,
+        tensor_parallel_size=2
+        )
+    print("Modell erfolgreich geladen.")
+
+except Exception as e:
+    print(f"Fehler beim Laden des Modells: {e}")
+
+def parse_icd_xml(xml_path):
+    tree = ET.parse(os.path.expanduser(xml_path))
+    root = tree.getroot()
+
+    leaf_nodes = []
+
+    for cl in root.findall("Class"):
+        kind = cl.get("kind")
+        if kind == "category":
+            subclasses = cl.findall("SubClass")
+            if len(subclasses) == 0:
+                code = cl.get("code")
+                for rubric in cl.findall("Rubric"):
+                    r_kind = rubric.get("kind")
+                    if r_kind in ["preferred", "preferredLong", "inclusion"]:
+                        label_elem = rubric.find("Label")
+                        if label_elem is not None and label_elem.text:
+                            text = label_elem.text.strip()
+                            leaf_nodes.append({
+                                "code": code,
+                                "all_texts": text
+                            })
+    return leaf_nodes
+
+def build_faiss_index(icd_leaf_nodes):
+    icd_texts = [node["all_texts"] for node in icd_leaf_nodes]
+    print("Erzeuge ICD-Embeddings ...")
+    icd_embeddings = embedding_model.encode(icd_texts, show_progress_bar=True)
+    icd_embeddings = np.array(icd_embeddings, dtype="float32")
+
+    dimension = icd_embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(icd_embeddings)
+
+    print(f"FAISS index size: {index.ntotal} Einträge")
+    return index
+
+def load_bert_ner_model():
+    tokenizer = BertTokenizerFast.from_pretrained('MSey/CaMedBERT-512_fl32_checkpoint-17386')
+    model = BertForTokenClassification.from_pretrained('MSey/CaMedBERT-512_fl32_checkpoint-17386')
+    if device == 0:
+        model.to('cuda')
+
+    ner_pipeline = pipeline(
+        'ner',
+        model=model,
+        tokenizer=tokenizer,
+        aggregation_strategy="simple",
+        device=device
+    )
+    return ner_pipeline
+
+def identify_negation_spacy(text, spans):
+
+    nlp_de = spacy.load("de_core_news_lg")
+
+
+    if "ner" in nlp_de.pipe_names:
+        nlp_de.disable_pipes("ner")
+
+
+    path_to_json = os.path.expanduser("~/work/ICD_QA/de_negex_termset.json")
+    with open(path_to_json, "r", encoding="utf-8") as f:
+        custom_terms = json.load(f)
+
+
+    nlp_de.add_pipe("negex", config={
+        "ent_types": ["DIAGNOSIS"],
+        "neg_termset": custom_terms
+    })
+
+    doc = nlp_de(text)
+
+    ents = []
+    for start_char, end_char in spans:
+        spacy_span = doc.char_span(start_char, end_char, label="DIAGNOSIS")
+        if spacy_span is not None:
+            ents.append(spacy_span)
+    doc.ents = ents
+
+
+    negex_pipe = nlp_de.get_pipe("negex")
+    doc = negex_pipe(doc)
+
+    negation_dict = {}
+    for ent in doc.ents:
+        negation_dict[(ent.start_char, ent.end_char)] = ent._.negex
+
+    return negation_dict
+
+def extract_information_from_letter(letter_path, ner_pipeline):
+    with open(letter_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    ner_results_raw = ner_pipeline(text, stride=50)
+
+    diag_spans = []
+    for result in ner_results_raw:
+        if result["entity_group"] == "DIAGNOSIS":
+            diag_spans.append((result["start"], result["end"]))
+
+    negation_dict = identify_negation_spacy(text, diag_spans)
+
+    final_ner_results = []
+    for result in ner_results_raw:
+        if result["entity_group"] == "DIAGNOSIS":
+            start_idx = result["start"]
+            end_idx = result["end"]
+            snippet = text[start_idx:end_idx]
+            is_neg = negation_dict.get((start_idx, end_idx), False)
+
+            final_ner_results.append({
+                "span": (start_idx, end_idx),
+                "label": result["entity_group"],
+                "annotation": snippet,
+                "negated": is_neg,
+                "icd_code": None
+            })
+    return text, final_ner_results
+
+def normalisiere_diagnose_mit_context(llm, arztbrief_text, raw_diagnose, sampling_params):
+    found_abbrs = []
+    if medical_abbreviations:
+        for abbr, expansions in medical_abbreviations.items():
+            pattern = r"\b" + re.escape(abbr) + r"\b"
+            if re.search(pattern, raw_diagnose):
+                found_abbrs.append((abbr, expansions))
+    abbr_info_str = ""
+
+    if found_abbrs:
+        abbr_info_str += (
+            "**Hinweis**: Es wurden folgende Abkürzungen in der Diagnose gefunden (es können mehrere Bedeutungen vorliegen):\n\n"
+        )
+        for (abbr, expansions) in found_abbrs:
+            for meaning in expansions:
+                abbr_info_str += f"- {abbr} könnte (muss aber nicht) für '{meaning}' stehen.\n"
+        abbr_info_str += "\nBitte berücksichtige dies beim Ausschreiben der Diagnose.\n\n"
+
+    prompt = (
+        "Du bist eine medizinische Experten-KI für das Medizincontrolling, die Diagnosen "
+        "aus kardiologischen Arztbriefen normalisiert, damit diese später ICD-codiert werden können.\n"
+        "Deine Aufgaben sind:\n"
+        "1. Abkürzungen ausschreiben. Wenn du dir nicht sicher bist, was diese medizinische Abkürzung bedeutet, "
+        "nutze den Arztbrief und den Hinweis weiter unten als Kontext.\n"
+        "2. Rechtschreibfehler ausbessern.\n"
+        "3. Lemmatisieren.\n"
+        "Ändere dabei unter **keinen Umständen** die eigentliche Diagnose ab, da sich sonst der ICD Code ändern würde!\n\n"
+        f"Die zu normalisierende Diagnose lautet: **'{raw_diagnose}'**\n\n"
+        "Nutze diesen Arztbrief als Kontext:\n\n"
+        f"{arztbrief_text}\n\n"
+        + abbr_info_str +
+        "\nGib nur die **normalisierte Diagnose** zurück, ohne weitere Diagnosen zu nennen, oder sonstige Zusätze!"
+    )
+
+    print(abbr_info_str)
+    user_message = {"role": "user", "content": prompt}
+
+
+    try:
+        outputs = llm.chat([user_message], sampling_params)
+        response = outputs[0].outputs[0].text
+        normalized = response.strip()
+
+
+        if prompt in normalized:
+            normalized = normalized.replace(prompt, "").strip()
+        if "Die normalisierte Diagnose lautet:" in normalized:
+            normalized = normalized.replace("Die normalisierte Diagnose lautet:", "").strip()
+
+
+        normalized = normalized.split("\n")[0].strip()
+        return normalized.lower() if normalized else raw_diagnose
+
+    except Exception as e:
+        print(f"Fehler bei der Normalisierung: {e}")
+        return raw_diagnose
+
+def custom_scorer(query: str, choice: str, **kwargs) -> float:
+    """
+    Ein Scorer, der 'token_set_ratio' um ein paar Heuristiken ergänzt
+    und 'score_cutoff' ignoriert (wird von process.extract() ggf. übergeben).
+    """
+    base = fuzz.token_set_ratio(query, choice)
+
+    # Wortgrenzenbonus
+    pattern = re.escape(query.lower())
+    if re.search(pattern, choice.lower()):
+        base += 50
+
+    return base
+
+
+def lexical_search_fuzzy(query, icd_data, top_k=10):
+    texts = [entry["all_texts"].lower() for entry in icd_data]
+    matches = process.extract(query.lower(), texts, scorer=custom_scorer, limit=top_k)
+
+    results = []
+    for match_text, score, idx in matches:
+        results.append({
+            "code": icd_data[idx]["code"],
+            "all_texts": match_text,
+            "score": score
+        })
+    return results
+
+def semantic_search(query, index, icd_leaf_nodes, top_k=10):
+    query_emb = embedding_model.encode([query], show_progress_bar=False)
+    query_emb = np.array(query_emb, dtype="float32")
+
+    D, I = index.search(query_emb, top_k)
+
+    results = []
+    for rank, idx in enumerate(I[0]):
+        code = icd_leaf_nodes[idx]["code"]
+        texts = icd_leaf_nodes[idx]["all_texts"]
+        dist = D[0][rank]
+        results.append({
+            "code": code,
+            "all_texts": texts,
+            "dist": dist
+        })
+    return results
+
+def combine_search_results(lexical_results, semantic_results):
+    combined = {}
+
+
+    for result in semantic_results:
+        code = result["code"]
+        combined[code] = {
+            "code": result["code"],
+            "all_texts": result["all_texts"].lower(),
+            "dist": result.get("dist", 0)
+        }
+
+    for result in lexical_results:
+        code = result["code"]
+        if code not in combined:
+            combined[code] = {
+                "code": result["code"],
+                "all_texts": result["all_texts"].lower(),
+                "score": result.get("score", 0)
+            }
+
+    for value in combined.values():
+        print(value)
+
+    return list(combined.values())
+
+def waehle_icd_code_mit_context(llm, arztbrief_text, diagnose_text, combined_results, sampling_params):
+    candidate_str = ""
+    for r in combined_results:
+        candidate_str += f"- Code: {r['code']}, Text: {r['all_texts']}\n"
+
+    prompt = (
+        "Du bist eine medizinische KI, die den passenden ICD-Code zu einer Diagnose aus "
+        "einem Arztbrief wählt.\n\n"
+        f"Hier der Arztbrief:\n\n{arztbrief_text}\n\n"
+        f"Die aus dem Arztbrief normalisierte Diagnose, deren ICD Code du ermitteln sollst, "
+        f"lautet: '{diagnose_text}'.\n\n"
+        "Hier sind die möglichen ICD-Kandidaten aus denen du wählen darfst:\n"
+        f"{candidate_str}\n\n"
+        f"Wähle den am besten passenden ICD-Code zur Diagnose '{diagnose_text}' aus. "
+        "Wenn dir Details zur Diagnose fehlen, wähle einen ICD Code mit 'nicht näher bezeichnet', 'sonstige', oder 'o.n.A.' im Namen aus. "
+        "Du darfst nur Codes aus der Liste auswählen. Gib nur den Code als Antwort zurück."
+    )
+
+    user_message = {"role": "user", "content": prompt}
+
+    try:
+        outputs = llm.chat([user_message], sampling_params)
+        response = outputs[0].outputs[0].text
+        answer = response.strip().split('\n')[0].strip()
+
+        if prompt in answer:
+            answer = answer.replace(prompt, "").strip()
+
+        match = re.search(r"\b[A-Z]\d{2}(\.\d+)?\b", answer)
+        if match:
+            return match.group(0).strip()
+        else:
+            print(f"Konnte keinen ICD-Code im Text finden: '{answer}'")
+            return None
+    except Exception as e:
+        print(f"Fehler beim Auswählen des ICD-Codes: {e}")
+        return None
+
+def get_parent_code(icd_code: str) -> str:
+    if '.' not in icd_code:
+        return icd_code
+    main, sub = icd_code.split('.', 1)
+    if len(sub) == 1:
+        return main
+    else:
+        return f"{main}.{sub[:-1]}"
+
+def get_child_codes(parent_code: str, icd_leaf_nodes: list) -> list:
+    results = []
+    for node in icd_leaf_nodes:
+        code = node["code"]
+        if code.startswith(parent_code):
+            results.append(node)
+    return results
+
+def refine_icd_code(llm, arztbrief_text, chosen_code, diagnosis, icd_leaf_nodes, sampling_params=None):
+    parent_code = get_parent_code(chosen_code)
+    child_entries = get_child_codes(parent_code, icd_leaf_nodes)
+
+    if not child_entries:
+        return chosen_code
+
+    candidates_str = "\n".join([
+        f"- {entry['code']}: {entry['all_texts']}"
+        for entry in child_entries
+    ])
+    print(candidates_str)
+    prompt = (
+        f"Wähle aus den folgenden ICD Codes den am besten passenden ICD Code zur Diagnose {diagnosis} aus. "
+        "Wenn dir Details zur Diagnose fehlen, wähle einen Code mit 'nicht näher bezeichnet', 'sonstige', oder 'o.n.A.' im Namen.\n"
+        f"{candidates_str}\n\n"
+        "Lies den den Arztbrief um mehr Kontext zu erhalten:\n\n"
+        f"{arztbrief_text}\n\n"
+        "Gib nur den ICD Code zurück und keine weiteren Angaben."
+    )
+
+    user_message = {"role": "user", "content": prompt}
+
+    try:
+        outputs = llm.chat([user_message], sampling_params)
+        response = outputs[0].outputs[0].text
+        answer = response.strip()
+
+        match = re.search(r"\b[A-Z]\d{2}(\.\d+)?\b", answer)
+        if match:
+            refined_code = match.group(0).strip()
+            return refined_code
+        else:
+            print(f"Konnte keinen verfeinerten ICD-Code im Text finden: '{answer}'")
+            return chosen_code
+
+    except Exception as e:
+        print(f"Fehler bei der Verfeinerung: {e}")
+        return chosen_code
+
+def visualize_and_save_diagnoses(text, diagnoses_data, output_html_path):
+    ents = []
+    for diag in diagnoses_data:
+        start_idx, end_idx = diag["span"]
+        icd = diag["icd_code"] or "n/a"
+
+
+        if diag["negated"]:
+            label = "DIAGNOSIS_NEG"
+            display_info = f"(negiert, ICD={icd})"
+        else:
+            label = "DIAGNOSIS_POS"
+            display_info = f"(nicht negiert, ICD={icd})"
+
+        ents.append({
+            "start": start_idx,
+            "end": end_idx,
+            "label": label,
+            "kb_id": display_info,
+        })
+
+    data = {
+        "text": text,
+        "ents": ents,
+        "title": None
+    }
+
+    options = {
+        "colors": {
+            "DIAGNOSIS_NEG": "tomato",
+            "DIAGNOSIS_POS": "lightgreen",
+        }
+    }
+
+    html = displacy.render(data, style="ent", manual=True, options=options, jupyter=True)
+    html = displacy.render(data, style="ent", manual=True, options=options, jupyter=False)
+
+    with open(output_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Visualisierung gespeichert in: {output_html_path}")
+
+def init_ner_and_icd(icd_xml_path):
+    """
+    Lädt das BERT-NER-Pipeline-Modell und den ICD-Katalog (inkl. FAISS-Index).
+    Gibt (ner_pipeline, icd_leaf_nodes, faiss_index) zurück.
+    """
+    ner_pipeline = load_bert_ner_model()
+    icd_leaf_nodes = parse_icd_xml(icd_xml_path)
+    faiss_index = build_faiss_index(icd_leaf_nodes)
+    return ner_pipeline, icd_leaf_nodes, faiss_index
+
+import os
+
+def process_arztbrief(letter_path, ner_pipeline, icd_leaf_nodes, faiss_index, llm, sampling_params):
+    # Extraktion der Informationen aus dem Arztbrief
+    text, final_ner_results = extract_information_from_letter(letter_path, ner_pipeline)
+
+    # Bestimme den Log-Dateinamen basierend auf dem Namen des Arztbriefs
+    base_name = os.path.splitext(os.path.basename(letter_path))[0]
+    log_dir = "logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, f"{base_name}.log")
+
+    with open(log_file_path, "w", encoding="utf-8") as log_file:
+        for i, diag_dict in enumerate(final_ner_results, start=1):
+            raw_diag = diag_dict["annotation"]
+            log_file.write(f"=== Diagnose {i}/{len(final_ner_results)} ===\n")
+            log_file.write(f"raw_diag: {raw_diag}\n")
+
+            if diag_dict["negated"]:
+                log_file.write("-> Diagnose ist verneint!\n")
+
+
+            norm_diag = normalisiere_diagnose_mit_context(llm, text, raw_diag, sampling_params)
+            log_file.write(f"norm_diag: {norm_diag}\n")
+
+
+            lex_results = lexical_search_fuzzy(norm_diag, icd_leaf_nodes, top_k=10)
+            sem_results = semantic_search(norm_diag, faiss_index, icd_leaf_nodes, top_k=10)
+            combined_results = combine_search_results(lex_results, sem_results)
+            log_file.write(f"combined_results: {combined_results}\n")
+
+
+            chosen_code = waehle_icd_code_mit_context(llm, text, norm_diag, combined_results, sampling_params)
+            log_file.write(f"chosen_code: {chosen_code}\n")
+
+
+            if chosen_code:
+                refined_code = refine_icd_code(llm, text, chosen_code, norm_diag, icd_leaf_nodes, sampling_params)
+                log_file.write(f"refined_code: {refined_code}\n")
+                if refined_code:
+                    diag_dict["icd_code"] = refined_code
+                else:
+                    diag_dict["icd_code"] = chosen_code
+            else:
+                diag_dict["icd_code"] = None
+
+            log_file.write("\n")
+
+    return text, final_ner_results
+
+ner_pipeline, icd_leaf_nodes, faiss_index = init_ner_and_icd("~/work/ICD_QA/icd10gm _abridged.xml")
+
+input_folder = os.path.expanduser("INPUT DIRECTORY WITH .TXT Files")
+output_folder = os.path.expanduser("OUTPUT DIRECTORY")
+
+os.makedirs(output_folder, exist_ok=True)
+
+for file_path in glob.glob(os.path.join(input_folder, "*.txt")):
+    print(f"Verarbeite Datei: {file_path}")
+
+
+    text, diagnoses = process_arztbrief(file_path, ner_pipeline, icd_leaf_nodes, faiss_index, llm, sampling_params)
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    output_html_path = os.path.join(output_folder, f"Annotierter_Arztbrief_{base_name}.html")
+    visualize_and_save_diagnoses(text, diagnoses, output_html_path)
+
+
+
+
+
+
+
+
+
